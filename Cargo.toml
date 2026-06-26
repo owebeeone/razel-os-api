@@ -1,0 +1,8 @@
+[package]
+name = "razel-os-api"
+version = "0.1.0"
+edition = "2021"
+description = "razelv4 System seam: the one OS/syscall surface + Fake + conformance. SKELETON."
+
+[dependencies]
+razel-core = { path = "../razel-core", version = "0.1.0" }
