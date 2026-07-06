@@ -133,6 +133,21 @@ fn linux_case_sensitive_policy() {
     assert!(p.normalize_fragment("..").is_err());
 }
 
+/// REQ-PATHTYPES-004 (DECIDED 2026-07-06, the pre-freeze open question): Darwin logical path identity is
+/// BYTE-EXACT — `CaseFold::Sensitive` — per the Bazel-parity rule (Bazel never case-folds path/label
+/// identity; APFS filesystem aliasing is an OS-effect concern for the source-probe layer, not identity).
+#[test]
+fn darwin_case_sensitive_logical_identity() {
+    let p = DarwinPolicy;
+    assert_ne!(p.normalize_fragment("A").unwrap(), p.normalize_fragment("a").unwrap(),
+        "two spellings differing only in case are DISTINCT logical fragments on Darwin");
+    assert_ne!(
+        p.canonicalize_alias(&HostPath::new("/private/var/X")),
+        p.canonicalize_alias(&HostPath::new("/private/var/x")),
+        "alias canonicalization never case-folds either (byte-exact identity)"
+    );
+}
+
 /// REQ-PATHTYPES-004: the Darwin `/var` firmlink alias canonicalizes so aliased spellings compare equal.
 #[test]
 fn darwin_var_alias_compares_equal() {

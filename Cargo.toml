@@ -7,3 +7,19 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 razel-core = { path = "../razel-core", version = "0.1.0" }
+
+[features]
+# RED-FIRST mutants (Canonical Mutant Registry, dev-docs/ContractManifest.md). Each deliberately breaks ONE
+# fail-closed law in a reference mock so its conformance gate MUST go red (tools/gate.sh inverts the exit).
+# Never enable in a real build.
+#
+# OS-SYSTEM row (gate: cargo test -p razel-os-api --test system_conformance):
+mutant_os_missing_read_as_empty = []       # FakeSystem::read of a missing path absorbs to Ok(vec![]) — the v3
+                                           # Absorb at the OS boundary → missing_path_is_error_never_empty_value
+mutant_os_stat_mtime_absorbed_to_zero = [] # FakeSystem::stat/lstat absorb the mtime to a constant 0 (stat can
+                                           # no longer see a rewrite) → metadata_exposes_dirtycheck_fields
+# PATHS-AND-ENV row (gate: cargo test -p razel-os-api --test env_conformance):
+mutant_env_undeclared_as_unset = []        # DeclaredClientEnv::get of an UNDECLARED name absorbs to Ok(Unset)
+                                           # instead of a loud typed error → undeclared_env_read_fails_closed
+mutant_env_read_not_recorded = []          # DeclaredClientEnv::get skips recording the EnvVarKey dependency
+                                           # → env_read_records_envvar_node
