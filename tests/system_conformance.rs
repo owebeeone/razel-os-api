@@ -13,8 +13,10 @@
 //! `tools/test_raw_os.py` + `tools/wall_fixtures.py` (fixture_s3_raw_os_alias), REQ-SYSTEM-001/002/010.
 
 use razel_os_api::conformance::{
-    args_reflect_construction, list_dir_is_deterministic, lstat_does_not_follow_final_symlink,
-    metadata_dirtycheck_fields_see_rewrite, missing_is_notfound, read_roundtrip, uds_stream_echo, FakeSystem,
+    args_reflect_construction, create_dir_all_is_observable, list_dir_is_deterministic,
+    lstat_does_not_follow_final_symlink, metadata_dirtycheck_fields_see_rewrite, missing_is_notfound,
+    read_roundtrip, remove_dir_all_clears_subtree, remove_file_clears_and_is_fail_closed,
+    rename_moves_bytes_and_clears_src, temp_dir_is_fresh_and_removable, uds_stream_echo, FakeSystem,
 };
 use razel_os_api::{EnvName, FileKind, HostPath, OsError, OsPathFragment, OsPathPolicy, ProcessSpec, System};
 use std::sync::Arc;
@@ -199,6 +201,26 @@ fn args_reflect_constructed_argv() {
     let fs = FakeSystem::new().with_args(&["razel-daemon", "batch", "build", "//hello:out.txt"]);
     args_reflect_construction(&fs, &["razel-daemon", "batch", "build", "//hello:out.txt"]);
     args_reflect_construction(&FakeSystem::new(), &[]);
+}
+
+/// Staging & exec-root primitives on the Fake half of the one suite (the SAME property fns run on the
+/// real `DarwinSystem` in razel-os-darwin/tests/conformance.rs — REQ-SYSTEM-005). The real-execution leg's
+/// os-system trait-growth: create_dir_all / rename / remove_file / remove_dir_all / temp_dir over the
+/// Fake's in-memory tree. Seeds source files via the `put_file` fixture (the impl-specific half).
+#[test]
+fn staging_and_exec_root_primitives_on_fake() {
+    create_dir_all_is_observable(&FakeSystem::new(), &p("/exec/root/sub"));
+
+    let mut fs = FakeSystem::new();
+    fs.put_file("/exec/src.txt", b"payload");
+    rename_moves_bytes_and_clears_src(&fs, &p("/exec/src.txt"), &p("/exec/dst.txt"), b"payload");
+
+    let mut fs2 = FakeSystem::new();
+    fs2.put_file("/exec/gone.txt", b"x");
+    remove_file_clears_and_is_fail_closed(&fs2, &p("/exec/gone.txt"));
+
+    remove_dir_all_clears_subtree(&FakeSystem::new(), &p("/exec/base"), &p("/exec/base/deep/child"));
+    temp_dir_is_fresh_and_removable(&FakeSystem::new());
 }
 
 /// The UDS byte-stream capability on the Fake half of the one suite (the SAME `uds_stream_echo` runs

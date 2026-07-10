@@ -114,9 +114,48 @@ pub trait System: Send + Sync {
     fn raw_env(&self, name: &EnvName) -> Option<OsValue>;
     fn spawn(&self, spec: &ProcessSpec) -> Result<ExitStatus, OsError>;
     fn path_policy(&self) -> &dyn OsPathPolicy;
-    // The remaining surface (symlink/hardlink/clone_file/rename/create_dir_all/remove_*/temp_dir(guard)/
-    // file_lock(guard)/wait/signal) extends this same typed, fail-closed shape — omitted from the
-    // skeleton for brevity, not by design.
+    // The remaining surface (symlink/hardlink/clone_file/file_lock(guard)/wait/signal) extends this same
+    // typed, fail-closed shape — omitted from the skeleton for brevity, not by design. The staging &
+    // exec-root primitives below (create_dir_all/rename/remove_*/temp_dir) SHIP now — the real-execution
+    // leg's os-system trait-growth reconcile (`RazelV4ArtifactModelLockdown.md` §6.5, decision G/R4).
+
+    // ──────────────── staging & exec-root primitives (the real-execution leg — additive) ────────────────
+    // These grow the seam for on-disk action staging — a strategy-PRIVATE concern above the seam (no engine
+    // contract sees a `HostPath`, REQ-PATHENV-007): a `LocalSpawnStrategy` allocates a per-execution exec
+    // root via `temp_dir`, stages inputs under it (`create_dir_all` + `write_atomic`), `spawn`s, collects
+    // outputs, then tears the root down (`remove_dir_all`). DEFAULT-provided (loud `Unsupported`) so growing
+    // the seam is additive — an impl with no writable-filesystem model keeps compiling unchanged (the same
+    // additive pattern as the argv/UDS capability); `DarwinSystem` overrides them over `std::fs` (the exempt
+    // crate), `FakeSystem` over its in-memory tree.
+    /// Create `p` and every missing parent directory. Idempotent — an existing directory is NOT an error.
+    fn create_dir_all(&self, p: &HostPath) -> Result<(), OsError> {
+        let _ = p;
+        Err(OsError::Unsupported { op: "create_dir_all", detail: "this System has no writable-filesystem model".into() })
+    }
+    /// Atomically move `src` → `dst` (the collect-into-place primitive). `src` must exist (fail-closed:
+    /// a missing source is a typed `NotFound`, never a silent no-op); an existing `dst` is replaced.
+    fn rename(&self, src: &HostPath, dst: &HostPath) -> Result<(), OsError> {
+        let _ = (src, dst);
+        Err(OsError::Unsupported { op: "rename", detail: "this System has no writable-filesystem model".into() })
+    }
+    /// Remove a single file. Fail-closed: a missing path is a typed `NotFound`, never a silent success.
+    fn remove_file(&self, p: &HostPath) -> Result<(), OsError> {
+        let _ = p;
+        Err(OsError::Unsupported { op: "remove_file", detail: "this System has no writable-filesystem model".into() })
+    }
+    /// Recursively remove a directory and all its contents — the exec-root teardown. Fail-closed on an
+    /// absent directory (typed `NotFound`).
+    fn remove_dir_all(&self, p: &HostPath) -> Result<(), OsError> {
+        let _ = p;
+        Err(OsError::Unsupported { op: "remove_dir_all", detail: "this System has no writable-filesystem model".into() })
+    }
+    /// Allocate a FRESH, unique, already-created directory under the system temp root — the exec-root
+    /// allocator. Each call yields a DISTINCT path (no ambient `TMPDIR` read above the seam). Lifecycle is
+    /// EXPLICIT: the caller tears the directory down via `remove_dir_all` (this ships the explicit-lifecycle
+    /// exec-root allocator, NOT the contract sketch's RAII `TempDir` guard — see the os-system row note).
+    fn temp_dir(&self) -> Result<HostPath, OsError> {
+        Err(OsError::Unsupported { op: "temp_dir", detail: "this System has no writable-filesystem model".into() })
+    }
 
     // ──────────────── argv + working directory (the T10 wall-forced gap) ────────────────
     /// The process command line (argv). The sanctioned argv capability: a daemon-rooted binary reads
@@ -166,7 +205,7 @@ pub trait System: Send + Sync {
 // ──────────────── In-memory Fake + the parameterized conformance suite ────────────────
 pub mod conformance {
     use super::*;
-    use std::collections::{BTreeMap, HashMap, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
     use std::sync::{Arc, Condvar, Mutex};
 
     // ──────────────── the in-memory paired-stream fake (UDS capability) ────────────────
@@ -303,82 +342,20 @@ pub mod conformance {
         file_id: u64,
     }
 
-    /// The cross-platform reference impl. Makes every layer above testable without a real OS.
-    /// Models the *shipped* `System` surface faithfully: fail-closed missingness, a fake clock so
-    /// `Metadata` dirty-check fields are real (REQ-SYSTEM-013), symlink entries with RAW targets so
-    /// `lstat` ≠ `stat` is observable (REQ-SYSTEM-007), a constructed-in env snapshot (no ambient state,
-    /// REQ-SYSTEM-015), and a pluggable `OsPathPolicy` so per-OS path semantics run on the Fake
-    /// (REQ-SYSTEM-008/014). Still a skeleton where the trait is: `write_atomic`/`spawn` are loud
-    /// `Unsupported`, never a silent success (REQ-SYSTEM-003's vocabulary).
-    pub struct FakeSystem {
+    /// The mutable in-memory tree behind the Fake's [`Mutex`] — files, symlinks, and (new for the
+    /// real-execution leg) explicit directories + a temp-dir sequence. Split out so the `System` READ
+    /// methods lock ONCE and the new staging ops (`create_dir_all`/`rename`/`remove_*`/`temp_dir`) mutate
+    /// through the SAME lock: the Fake now models a WRITABLE directory structure (file CONTENT still enters
+    /// via the `put_file` fixture — `write_atomic` stays a loud skeleton `Unsupported`).
+    struct FakeTree {
         files: BTreeMap<String, FakeFile>,
         symlinks: BTreeMap<String, FakeLink>,
-        env: EnvMap,
-        policy: Box<dyn OsPathPolicy>,
-        tick: i128,   // fake clock: strictly increases per write, so a rewrite is visible in mtime
-        next_id: u64, // stable per-path file ids
-        args: Vec<String>,     // constructed-in argv (no ambient process argv — REQ-SYSTEM-015 shape)
-        net: Arc<FakeNet>,     // the process-local UDS broker (shared across an Arc<dyn System>)
+        dirs: BTreeSet<String>, // explicit directories (created via create_dir_all / temp_dir)
+        tick: i128,             // fake clock: strictly increases per write, so a rewrite is visible in mtime
+        next_id: u64,           // stable per-path file ids
+        temp_seq: u64,          // monotonic sequence → each temp_dir() is a distinct path
     }
-    impl Default for FakeSystem {
-        fn default() -> Self {
-            Self {
-                files: BTreeMap::new(),
-                symlinks: BTreeMap::new(),
-                env: EnvMap::new(),
-                policy: Box::new(IdentityPolicy),
-                tick: 0,
-                next_id: 0,
-                args: Vec::new(),
-                net: Arc::new(FakeNet::new()),
-            }
-        }
-    }
-    impl FakeSystem {
-        pub fn new() -> Self { Self::default() }
-        /// Constructed-in argv snapshot — the Fake's `args()` reads THIS, never the ambient process argv.
-        pub fn with_args(mut self, args: &[&str]) -> Self {
-            self.args = args.iter().map(|s| s.to_string()).collect();
-            self
-        }
-        pub fn with_file(mut self, p: &str, bytes: &[u8]) -> Self {
-            self.put_file(p, bytes);
-            self
-        }
-        /// Rewrite-capable fixture edit: bumps the fake clock, keeps the path's `file_id` stable — the
-        /// REQ-SYSTEM-013 dirty-check fields behave like a real filesystem's.
-        pub fn put_file(&mut self, p: &str, bytes: &[u8]) {
-            self.tick += 1;
-            let file_id = match self.files.get(p) {
-                Some(f) => f.file_id,
-                None => {
-                    self.next_id += 1;
-                    self.next_id
-                }
-            };
-            self.files.insert(p.to_string(), FakeFile { bytes: bytes.to_vec(), mtime_nanos: self.tick, file_id });
-        }
-        /// A symlink entry with its RAW (possibly relative) target — never canonicalized (REQ-SYSTEM-007).
-        pub fn with_symlink(mut self, link: &str, raw_target: &str) -> Self {
-            self.tick += 1;
-            self.next_id += 1;
-            self.symlinks.insert(
-                link.to_string(),
-                FakeLink { target: RawSymlinkTarget(raw_target.to_string()), mtime_nanos: self.tick, file_id: self.next_id },
-            );
-            self
-        }
-        /// Constructed-in env snapshot — the Fake's `raw_env` reads THIS, never the ambient process env.
-        pub fn with_env(mut self, name: &str, value: &str) -> Self {
-            self.env.insert(EnvName(name.to_string()), OsValue(value.to_string()));
-            self
-        }
-        /// Per-OS path semantics on the Fake (REQ-SYSTEM-008/014): Darwin/Windows policies run here even
-        /// where the test host is neither.
-        pub fn with_policy(mut self, policy: Box<dyn OsPathPolicy>) -> Self {
-            self.policy = policy;
-            self
-        }
+    impl FakeTree {
         /// Follow symlinks (bounded); a relative target resolves against the link's parent directory.
         fn resolve(&self, p: &HostPath) -> Result<String, OsError> {
             let mut cur = p.as_str().to_string();
@@ -411,11 +388,116 @@ pub mod conformance {
             let mtime_nanos = f.mtime_nanos;
             Metadata { kind: FileKind::File, len: f.bytes.len() as u64, mtime_nanos, file_id: f.file_id }
         }
+        /// Rewrite-capable fixture edit: bumps the fake clock, keeps the path's `file_id` stable — the
+        /// REQ-SYSTEM-013 dirty-check fields behave like a real filesystem's.
+        fn put_file(&mut self, p: &str, bytes: &[u8]) {
+            self.tick += 1;
+            let file_id = match self.files.get(p) {
+                Some(f) => f.file_id,
+                None => {
+                    self.next_id += 1;
+                    self.next_id
+                }
+            };
+            self.files.insert(p.to_string(), FakeFile { bytes: bytes.to_vec(), mtime_nanos: self.tick, file_id });
+        }
+        fn put_symlink(&mut self, link: &str, raw_target: &str) {
+            self.tick += 1;
+            self.next_id += 1;
+            self.symlinks.insert(
+                link.to_string(),
+                FakeLink { target: RawSymlinkTarget(raw_target.to_string()), mtime_nanos: self.tick, file_id: self.next_id },
+            );
+        }
+        /// A path (or symlink or explicit dir) is present. Dirs count as existing (REQ-SYSTEM staging).
+        fn exists(&self, p: &str) -> bool {
+            self.files.contains_key(p) || self.symlinks.contains_key(p) || self.dirs.contains(p)
+        }
+        /// Insert `p` and every ancestor directory (idempotent). Paths are absolute host paths in the Fake.
+        fn create_dir_all(&mut self, p: &str) {
+            let mut acc = String::new();
+            for seg in p.split('/') {
+                if seg.is_empty() {
+                    continue;
+                }
+                acc.push('/');
+                acc.push_str(seg);
+                self.dirs.insert(acc.clone());
+            }
+        }
+    }
+
+    /// The cross-platform reference impl. Makes every layer above testable without a real OS.
+    /// Models the *shipped* `System` surface faithfully: fail-closed missingness, a fake clock so
+    /// `Metadata` dirty-check fields are real (REQ-SYSTEM-013), symlink entries with RAW targets so
+    /// `lstat` ≠ `stat` is observable (REQ-SYSTEM-007), a constructed-in env snapshot (no ambient state,
+    /// REQ-SYSTEM-015), a pluggable `OsPathPolicy` so per-OS path semantics run on the Fake
+    /// (REQ-SYSTEM-008/014), and (new) a WRITABLE directory tree behind a `Mutex` so the staging &
+    /// exec-root primitives run on the Fake half of the one suite. Still a skeleton where the trait is:
+    /// `write_atomic`/`spawn` are loud `Unsupported`, never a silent success (REQ-SYSTEM-003's vocabulary).
+    pub struct FakeSystem {
+        tree: Mutex<FakeTree>,
+        env: EnvMap,
+        policy: Box<dyn OsPathPolicy>,
+        args: Vec<String>, // constructed-in argv (no ambient process argv — REQ-SYSTEM-015 shape)
+        net: Arc<FakeNet>, // the process-local UDS broker (shared across an Arc<dyn System>)
+    }
+    impl Default for FakeSystem {
+        fn default() -> Self {
+            Self {
+                tree: Mutex::new(FakeTree {
+                    files: BTreeMap::new(),
+                    symlinks: BTreeMap::new(),
+                    dirs: BTreeSet::new(),
+                    tick: 0,
+                    next_id: 0,
+                    temp_seq: 0,
+                }),
+                env: EnvMap::new(),
+                policy: Box::new(IdentityPolicy),
+                args: Vec::new(),
+                net: Arc::new(FakeNet::new()),
+            }
+        }
+    }
+    impl FakeSystem {
+        pub fn new() -> Self { Self::default() }
+        /// Constructed-in argv snapshot — the Fake's `args()` reads THIS, never the ambient process argv.
+        pub fn with_args(mut self, args: &[&str]) -> Self {
+            self.args = args.iter().map(|s| s.to_string()).collect();
+            self
+        }
+        pub fn with_file(mut self, p: &str, bytes: &[u8]) -> Self {
+            self.put_file(p, bytes);
+            self
+        }
+        /// Rewrite-capable fixture edit: bumps the fake clock, keeps the path's `file_id` stable — the
+        /// REQ-SYSTEM-013 dirty-check fields behave like a real filesystem's.
+        pub fn put_file(&mut self, p: &str, bytes: &[u8]) {
+            self.tree.get_mut().unwrap().put_file(p, bytes);
+        }
+        /// A symlink entry with its RAW (possibly relative) target — never canonicalized (REQ-SYSTEM-007).
+        pub fn with_symlink(mut self, link: &str, raw_target: &str) -> Self {
+            self.tree.get_mut().unwrap().put_symlink(link, raw_target);
+            self
+        }
+        /// Constructed-in env snapshot — the Fake's `raw_env` reads THIS, never the ambient process env.
+        pub fn with_env(mut self, name: &str, value: &str) -> Self {
+            self.env.insert(EnvName(name.to_string()), OsValue(value.to_string()));
+            self
+        }
+        /// Per-OS path semantics on the Fake (REQ-SYSTEM-008/014): Darwin/Windows policies run here even
+        /// where the test host is neither.
+        pub fn with_policy(mut self, policy: Box<dyn OsPathPolicy>) -> Self {
+            self.policy = policy;
+            self
+        }
     }
     impl System for FakeSystem {
         fn read(&self, p: &HostPath) -> Result<Vec<u8>, OsError> {
-            let key = self.resolve(p)?;
-            match self.files.get(&key) {
+            let t = self.tree.lock().unwrap();
+            let key = t.resolve(p)?;
+            match t.files.get(&key) {
                 Some(f) => Ok(f.bytes.clone()),
                 None => {
                     // MUTANT `mutant_os_missing_read_as_empty` (os-system row red-first evidence): the v3
@@ -433,43 +515,50 @@ pub mod conformance {
             Err(OsError::Unsupported { op: "write_atomic", detail: "skeleton Fake is read-only via System; use put_file".into() })
         }
         fn exists(&self, p: &HostPath) -> Result<bool, OsError> {
-            // lstat semantics, matching the Darwin impl (`symlink_metadata`): a dangling link EXISTS.
-            Ok(self.files.contains_key(p.as_str()) || self.symlinks.contains_key(p.as_str()))
+            // lstat semantics, matching the Darwin impl (`symlink_metadata`): a dangling link EXISTS; a
+            // created directory EXISTS (the staging tree).
+            Ok(self.tree.lock().unwrap().exists(p.as_str()))
         }
         fn stat(&self, p: &HostPath) -> Result<Metadata, OsError> {
-            let key = self.resolve(p)?;
-            self.files.get(&key).map(Self::file_meta).ok_or_else(|| OsError::NotFound { path: p.as_str().into() })
+            let t = self.tree.lock().unwrap();
+            let key = t.resolve(p)?;
+            t.files.get(&key).map(FakeTree::file_meta).ok_or_else(|| OsError::NotFound { path: p.as_str().into() })
         }
         fn lstat(&self, p: &HostPath) -> Result<Metadata, OsError> {
-            if let Some(l) = self.symlinks.get(p.as_str()) {
+            let t = self.tree.lock().unwrap();
+            if let Some(l) = t.symlinks.get(p.as_str()) {
                 #[cfg(feature = "mutant_os_stat_mtime_absorbed_to_zero")]
                 let mtime_nanos = 0;
                 #[cfg(not(feature = "mutant_os_stat_mtime_absorbed_to_zero"))]
                 let mtime_nanos = l.mtime_nanos;
                 return Ok(Metadata { kind: FileKind::Symlink, len: l.target.0.len() as u64, mtime_nanos, file_id: l.file_id });
             }
-            self.files.get(p.as_str()).map(Self::file_meta).ok_or_else(|| OsError::NotFound { path: p.as_str().into() })
+            t.files.get(p.as_str()).map(FakeTree::file_meta).ok_or_else(|| OsError::NotFound { path: p.as_str().into() })
         }
         fn list_dir(&self, p: &HostPath) -> Result<Vec<OsPathFragment>, OsError> {
+            let t = self.tree.lock().unwrap();
             let prefix = format!("{}/", p.as_str());
-            let mut out: Vec<OsPathFragment> = self
+            let mut out: Vec<OsPathFragment> = t
                 .files
                 .keys()
-                .chain(self.symlinks.keys())
+                .chain(t.symlinks.keys())
                 .filter_map(|k| k.strip_prefix(&prefix).filter(|r| !r.contains('/')))
                 .map(|r| OsPathFragment(r.to_string()))
                 .collect();
             // Fail closed (REQ-SYSTEM-004): the Fake has no empty-dir entries, so a prefix with NO entries
             // is a MISSING directory — a typed NotFound, never a default empty listing. (razel-source's
             // DIRECTORY_LISTING maps NotFound → empty-listing VALUE explicitly, above the seam.)
-            if out.is_empty() && !self.files.keys().chain(self.symlinks.keys()).any(|k| k.starts_with(&prefix)) {
+            if out.is_empty() && !t.files.keys().chain(t.symlinks.keys()).any(|k| k.starts_with(&prefix)) {
                 return Err(OsError::NotFound { path: p.as_str().into() });
             }
             out.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes())); // deterministic byte order
             Ok(out)
         }
         fn read_link(&self, p: &HostPath) -> Result<RawSymlinkTarget, OsError> {
-            self.symlinks
+            self.tree
+                .lock()
+                .unwrap()
+                .symlinks
                 .get(p.as_str())
                 .map(|l| l.target.clone())
                 .ok_or_else(|| OsError::NotFound { path: p.as_str().into() })
@@ -480,6 +569,58 @@ pub mod conformance {
             Err(OsError::Unsupported { op: "spawn", detail: "Fake has no process model".into() })
         }
         fn path_policy(&self) -> &dyn OsPathPolicy { self.policy.as_ref() }
+
+        // ── staging & exec-root primitives on the Fake (in-memory tree; the real-execution leg) ──
+        fn create_dir_all(&self, p: &HostPath) -> Result<(), OsError> {
+            self.tree.lock().unwrap().create_dir_all(p.as_str());
+            Ok(())
+        }
+        fn rename(&self, src: &HostPath, dst: &HostPath) -> Result<(), OsError> {
+            let mut t = self.tree.lock().unwrap();
+            // Move the entry, preserving its identity (file_id/mtime) — never a silent copy. `src` must
+            // exist (fail-closed NotFound); the move replaces any existing `dst`.
+            if let Some(f) = t.files.remove(src.as_str()) {
+                t.files.insert(dst.as_str().to_string(), f);
+                Ok(())
+            } else if let Some(l) = t.symlinks.remove(src.as_str()) {
+                t.symlinks.insert(dst.as_str().to_string(), l);
+                Ok(())
+            } else {
+                Err(OsError::NotFound { path: src.as_str().into() })
+            }
+        }
+        fn remove_file(&self, p: &HostPath) -> Result<(), OsError> {
+            let mut t = self.tree.lock().unwrap();
+            if t.files.remove(p.as_str()).is_some() || t.symlinks.remove(p.as_str()).is_some() {
+                Ok(())
+            } else {
+                Err(OsError::NotFound { path: p.as_str().into() })
+            }
+        }
+        fn remove_dir_all(&self, p: &HostPath) -> Result<(), OsError> {
+            let mut t = self.tree.lock().unwrap();
+            let dir = p.as_str().to_string();
+            let prefix = format!("{dir}/");
+            let present = t.dirs.contains(&dir)
+                || t.files.contains_key(&dir)
+                || t.files.keys().chain(t.symlinks.keys()).any(|k| k.starts_with(&prefix))
+                || t.dirs.iter().any(|d| d.starts_with(&prefix));
+            if !present {
+                return Err(OsError::NotFound { path: p.as_str().into() });
+            }
+            t.files.retain(|k, _| k != &dir && !k.starts_with(&prefix));
+            t.symlinks.retain(|k, _| k != &dir && !k.starts_with(&prefix));
+            t.dirs.retain(|d| d != &dir && !d.starts_with(&prefix));
+            Ok(())
+        }
+        fn temp_dir(&self) -> Result<HostPath, OsError> {
+            let mut t = self.tree.lock().unwrap();
+            t.temp_seq += 1;
+            // A distinct, already-created directory per call (the exec-root allocator). No ambient TMPDIR.
+            let path = format!("/tmp/razel-fake-exec-{}", t.temp_seq);
+            t.dirs.insert(path.clone());
+            Ok(HostPath::new(path))
+        }
 
         // ── argv + UDS on the Fake (the in-memory paired-stream capability) ──
         fn args(&self) -> Vec<String> { self.args.clone() }
@@ -560,6 +701,65 @@ pub mod conformance {
         assert_eq!(before.file_id, after.file_id, "an in-place rewrite must keep the file id stable");
         assert!(after.mtime_nanos > before.mtime_nanos || after.len != before.len,
             "a rewrite MUST be visible in the dirty-check fields (mtime advanced or size changed): before={before:?} after={after:?}");
+    }
+
+    // ──────────────── staging & exec-root primitives (the real-execution leg — one suite, all impls) ────────────────
+    // Trait-only property fns (no impl-specific field access): the caller seeds any source file via
+    // impl-specific means (Fake: `put_file`; Darwin: `std::fs::write`), everything else is the trait.
+
+    /// `create_dir_all` makes a directory OBSERVABLE via `exists` (and is idempotent — a re-create is Ok).
+    pub fn create_dir_all_is_observable<S: System>(sys: &S, dir: &HostPath) {
+        assert!(!sys.exists(dir).expect("exists before"), "precondition: the directory does not yet exist");
+        sys.create_dir_all(dir).expect("create_dir_all succeeds");
+        assert!(sys.exists(dir).expect("exists after"), "a created directory is observable via exists()");
+        sys.create_dir_all(dir).expect("create_dir_all is idempotent (an existing dir is not an error)");
+    }
+
+    /// `rename` MOVES the bytes to `dst` and CLEARS `src` — never a copy, fail-closed both directions.
+    /// Precondition: `src` holds `expect` (seeded by the caller).
+    pub fn rename_moves_bytes_and_clears_src<S: System>(sys: &S, src: &HostPath, dst: &HostPath, expect: &[u8]) {
+        assert_eq!(sys.read(src).expect("src seeded"), expect, "precondition: src holds the bytes");
+        sys.rename(src, dst).expect("rename succeeds");
+        assert_eq!(sys.read(dst).expect("dst present after rename"), expect, "rename moves the bytes to dst");
+        assert!(matches!(sys.read(src), Err(OsError::NotFound { .. })),
+            "rename removes the source (a move, never a copy)");
+    }
+
+    /// `remove_file` clears a present file and is fail-closed on an absent one (typed NotFound, never a
+    /// silent success). Precondition: `p` is present (seeded by the caller).
+    pub fn remove_file_clears_and_is_fail_closed<S: System>(sys: &S, p: &HostPath) {
+        assert!(sys.exists(p).expect("exists before"), "precondition: the file is present");
+        sys.remove_file(p).expect("remove_file succeeds on a present file");
+        assert!(!sys.exists(p).expect("exists after"), "remove_file clears the path");
+        assert!(matches!(sys.remove_file(p), Err(OsError::NotFound { .. })),
+            "removing an absent file is a typed NotFound, never a silent success");
+    }
+
+    /// `remove_dir_all` clears the ENTIRE subtree (parent + nested descendants). `child` is a nested path
+    /// under `base` (e.g. `base/deep/child`); `create_dir_all(child)` materializes both.
+    pub fn remove_dir_all_clears_subtree<S: System>(sys: &S, base: &HostPath, child: &HostPath) {
+        sys.create_dir_all(child).expect("create the nested child (materializes base + ancestors)");
+        assert!(sys.exists(base).expect("base exists") && sys.exists(child).expect("child exists"),
+            "precondition: base and its nested child both exist");
+        sys.remove_dir_all(base).expect("remove_dir_all base");
+        assert!(!sys.exists(base).expect("base gone") && !sys.exists(child).expect("child gone"),
+            "remove_dir_all clears the entire subtree");
+    }
+
+    /// `temp_dir` is the exec-root allocator: each call yields a DISTINCT, already-created directory, and
+    /// its lifecycle is OBSERVABLE (removed via `remove_dir_all`, REQ-SYSTEM-012's observable-teardown half
+    /// — the explicit-lifecycle allocator, not a RAII guard). Removing one temp dir leaves a sibling intact.
+    pub fn temp_dir_is_fresh_and_removable<S: System>(sys: &S) {
+        let a = sys.temp_dir().expect("temp_dir a");
+        let b = sys.temp_dir().expect("temp_dir b");
+        assert_ne!(a, b, "each temp_dir() call yields a DISTINCT path (no ambient collision)");
+        assert!(sys.exists(&a).expect("exists a") && sys.exists(&b).expect("exists b"),
+            "temp_dir yields an already-created directory");
+        sys.remove_dir_all(&a).expect("remove_dir_all a");
+        assert!(!sys.exists(&a).expect("exists a after"),
+            "the exec-root teardown is observable (REQ-SYSTEM-012 lifecycle)");
+        assert!(sys.exists(&b).expect("exists b after"), "removing one temp dir must not affect a sibling");
+        sys.remove_dir_all(&b).expect("cleanup b");
     }
 
     /// The argv capability (T10-flagged): `args()` reflects the constructed-in command line and does
