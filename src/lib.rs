@@ -80,7 +80,28 @@ pub struct ProcessSpec {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ExitStatus { pub code: i32 }
 
+// ──────────────── UDS socket capability — opaque handles (byte-stream; framing lives ABOVE) ────────────────
+// The comms plane needs sockets, but the raw-OS wall bans `std::net`/`std::os` outside razel-os-darwin.
+// So the socket capability grows on THIS seam (additive; the first slice of the os-system trait-growth
+// reconcile). A handle carries an impl-owned payload as `Any` — the api crate never names a std socket
+// type; razel-os-darwin stows a real `UnixListener`/`UnixStream`, `FakeSystem` an in-memory paired end.
+// Consumers hold handles opaquely and drive them through `System`; the byte-stream framing is above.
+pub struct UdsListener(Box<dyn std::any::Any + Send + Sync>);
+pub struct UdsStream(Box<dyn std::any::Any + Send + Sync>);
+impl UdsListener {
+    pub fn new<T: std::any::Any + Send + Sync>(inner: T) -> Self { Self(Box::new(inner)) }
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> { self.0.downcast_ref::<T>() }
+}
+impl UdsStream {
+    pub fn new<T: std::any::Any + Send + Sync>(inner: T) -> Self { Self(Box::new(inner)) }
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> { self.0.downcast_ref::<T>() }
+}
+
 /// The one OS/syscall seam. Every impl (Fake + per-OS) passes the SAME conformance suite.
+///
+/// The argv + UDS methods are DEFAULT-provided (loud `Unsupported` / empty) so growing the seam is
+/// additive — a `System` impl that has no process/socket model keeps compiling unchanged; the shipped
+/// `DarwinSystem` and the reference `FakeSystem` override them.
 pub trait System: Send + Sync {
     fn read(&self, p: &HostPath) -> Result<Vec<u8>, OsError>;
     fn write_atomic(&self, p: &HostPath, bytes: &[u8]) -> Result<(), OsError>;
@@ -94,14 +115,171 @@ pub trait System: Send + Sync {
     fn spawn(&self, spec: &ProcessSpec) -> Result<ExitStatus, OsError>;
     fn path_policy(&self) -> &dyn OsPathPolicy;
     // The remaining surface (symlink/hardlink/clone_file/rename/create_dir_all/remove_*/temp_dir(guard)/
-    // file_lock(guard)/wait/signal/cwd) extends this same typed, fail-closed shape — omitted from the
+    // file_lock(guard)/wait/signal) extends this same typed, fail-closed shape — omitted from the
     // skeleton for brevity, not by design.
+
+    // ──────────────── argv + working directory (the T10 wall-forced gap) ────────────────
+    /// The process command line (argv). The sanctioned argv capability: a daemon-rooted binary reads
+    /// its command line HERE, never via `std::env` (which the raw-OS wall bans outside razel-os-darwin).
+    /// Default: empty (an impl with no process model exposes no argv).
+    fn args(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The process working directory. Default: a loud `Unsupported` (an impl with no cwd notion).
+    fn cwd(&self) -> Result<HostPath, OsError> {
+        Err(OsError::Unsupported { op: "cwd", detail: "this System has no working-directory notion".into() })
+    }
+
+    // ──────────────── UDS byte-stream capability (blocking v1; framing lives above) ────────────────
+    /// Bind a Unix-domain socket at `path` and start listening. Blocking accept (v1). Default: `Unsupported`.
+    fn uds_bind_listen(&self, path: &HostPath) -> Result<UdsListener, OsError> {
+        let _ = path;
+        Err(OsError::Unsupported { op: "uds_bind_listen", detail: "this System has no socket capability".into() })
+    }
+    /// Block until a peer connects; return the accepted byte stream. Default: `Unsupported`.
+    fn uds_accept(&self, listener: &UdsListener) -> Result<UdsStream, OsError> {
+        let _ = listener;
+        Err(OsError::Unsupported { op: "uds_accept", detail: "this System has no socket capability".into() })
+    }
+    /// Connect to a listening Unix-domain socket at `path`. Default: `Unsupported`.
+    fn uds_connect(&self, path: &HostPath) -> Result<UdsStream, OsError> {
+        let _ = path;
+        Err(OsError::Unsupported { op: "uds_connect", detail: "this System has no socket capability".into() })
+    }
+    /// Blocking read into `buf`; `Ok(0)` == the peer closed cleanly (EOF), never a spurious empty. Default: `Unsupported`.
+    fn stream_read(&self, stream: &UdsStream, buf: &mut [u8]) -> Result<usize, OsError> {
+        let _ = (stream, buf);
+        Err(OsError::Unsupported { op: "stream_read", detail: "this System has no socket capability".into() })
+    }
+    /// Write `bytes`; returns the count written. A closed peer is a typed error, never a silent drop. Default: `Unsupported`.
+    fn stream_write(&self, stream: &UdsStream, bytes: &[u8]) -> Result<usize, OsError> {
+        let _ = (stream, bytes);
+        Err(OsError::Unsupported { op: "stream_write", detail: "this System has no socket capability".into() })
+    }
+    /// Close a byte stream (idempotent). The peer's next read observes EOF; its next write, a typed error. Default: `Unsupported`.
+    fn stream_close(&self, stream: &UdsStream) -> Result<(), OsError> {
+        let _ = stream;
+        Err(OsError::Unsupported { op: "stream_close", detail: "this System has no socket capability".into() })
+    }
 }
 
 // ──────────────── In-memory Fake + the parameterized conformance suite ────────────────
 pub mod conformance {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap, VecDeque};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    // ──────────────── the in-memory paired-stream fake (UDS capability) ────────────────
+    // A blocking bidirectional byte pipe, enough to run the SAME transport logic without a real OS.
+    // Two `Pipe`s per connection (client→server, server→client) crossed between the endpoints.
+
+    struct ChanState {
+        buf: VecDeque<u8>,
+        closed: bool,
+    }
+    /// One direction of a byte pipe: a bounded-by-nothing buffer with a blocking reader (Condvar).
+    #[derive(Clone)]
+    struct Pipe {
+        inner: Arc<(Mutex<ChanState>, Condvar)>,
+    }
+    impl Pipe {
+        fn new() -> Self {
+            Pipe { inner: Arc::new((Mutex::new(ChanState { buf: VecDeque::new(), closed: false }), Condvar::new())) }
+        }
+        fn write(&self, bytes: &[u8]) -> Result<usize, OsError> {
+            let (m, cv) = &*self.inner;
+            let mut g = m.lock().unwrap();
+            if g.closed {
+                // A closed peer is a TYPED error, never a silent drop (the disconnect-cancel mechanism).
+                return Err(OsError::Io { detail: "broken pipe (peer closed)".into() });
+            }
+            g.buf.extend(bytes.iter().copied());
+            cv.notify_all();
+            Ok(bytes.len())
+        }
+        fn read(&self, buf: &mut [u8]) -> Result<usize, OsError> {
+            let (m, cv) = &*self.inner;
+            let mut g = m.lock().unwrap();
+            loop {
+                if !g.buf.is_empty() {
+                    let n = buf.len().min(g.buf.len());
+                    for slot in buf.iter_mut().take(n) {
+                        *slot = g.buf.pop_front().unwrap();
+                    }
+                    return Ok(n);
+                }
+                if g.closed {
+                    return Ok(0); // clean EOF — never a spurious empty on a LIVE pipe
+                }
+                g = cv.wait(g).unwrap();
+            }
+        }
+        fn close(&self) {
+            let (m, cv) = &*self.inner;
+            let mut g = m.lock().unwrap();
+            g.closed = true;
+            cv.notify_all();
+        }
+    }
+
+    /// One endpoint of a connection: read from `rd`, write to `wr`.
+    struct FakeStreamEnd {
+        rd: Pipe,
+        wr: Pipe,
+    }
+    impl Drop for FakeStreamEnd {
+        fn drop(&mut self) {
+            // Close on drop, mirroring a real socket fd: the peer's next read then sees a clean EOF (Ok(0)).
+            // Without this, dropping a stream handle (rather than calling stream_close) would leave a peer
+            // blocked forever — the Fake must model the OS's close-on-drop faithfully.
+            self.wr.close();
+        }
+    }
+
+    struct ListenerState {
+        pending: Mutex<VecDeque<FakeStreamEnd>>,
+        cv: Condvar,
+    }
+
+    /// The process-local socket broker: listeners keyed by bind path. Shared (`Arc`) so a `FakeSystem`
+    /// behind an `Arc<dyn System>` serves both the server thread and the client through one broker.
+    pub(super) struct FakeNet {
+        listeners: Mutex<HashMap<String, Arc<ListenerState>>>,
+    }
+    impl FakeNet {
+        fn new() -> Self {
+            FakeNet { listeners: Mutex::new(HashMap::new()) }
+        }
+        fn bind(&self, path: &str) -> Result<Arc<ListenerState>, OsError> {
+            let mut ls = self.listeners.lock().unwrap();
+            if ls.contains_key(path) {
+                return Err(OsError::AlreadyExists { path: path.into() });
+            }
+            let st = Arc::new(ListenerState { pending: Mutex::new(VecDeque::new()), cv: Condvar::new() });
+            ls.insert(path.into(), st.clone());
+            Ok(st)
+        }
+        fn connect(&self, path: &str) -> Result<FakeStreamEnd, OsError> {
+            let st = self.listeners.lock().unwrap().get(path).cloned()
+                .ok_or_else(|| OsError::NotFound { path: path.into() })?;
+            let c2s = Pipe::new();
+            let s2c = Pipe::new();
+            let server_end = FakeStreamEnd { rd: c2s.clone(), wr: s2c.clone() };
+            let client_end = FakeStreamEnd { rd: s2c, wr: c2s };
+            st.pending.lock().unwrap().push_back(server_end);
+            st.cv.notify_all();
+            Ok(client_end)
+        }
+        fn accept(st: &ListenerState) -> FakeStreamEnd {
+            let mut q = st.pending.lock().unwrap();
+            loop {
+                if let Some(end) = q.pop_front() {
+                    return end;
+                }
+                q = st.cv.wait(q).unwrap();
+            }
+        }
+    }
 
     struct IdentityPolicy;
     impl OsPathPolicy for IdentityPolicy {
@@ -139,6 +317,8 @@ pub mod conformance {
         policy: Box<dyn OsPathPolicy>,
         tick: i128,   // fake clock: strictly increases per write, so a rewrite is visible in mtime
         next_id: u64, // stable per-path file ids
+        args: Vec<String>,     // constructed-in argv (no ambient process argv — REQ-SYSTEM-015 shape)
+        net: Arc<FakeNet>,     // the process-local UDS broker (shared across an Arc<dyn System>)
     }
     impl Default for FakeSystem {
         fn default() -> Self {
@@ -149,11 +329,18 @@ pub mod conformance {
                 policy: Box::new(IdentityPolicy),
                 tick: 0,
                 next_id: 0,
+                args: Vec::new(),
+                net: Arc::new(FakeNet::new()),
             }
         }
     }
     impl FakeSystem {
         pub fn new() -> Self { Self::default() }
+        /// Constructed-in argv snapshot — the Fake's `args()` reads THIS, never the ambient process argv.
+        pub fn with_args(mut self, args: &[&str]) -> Self {
+            self.args = args.iter().map(|s| s.to_string()).collect();
+            self
+        }
         pub fn with_file(mut self, p: &str, bytes: &[u8]) -> Self {
             self.put_file(p, bytes);
             self
@@ -293,6 +480,37 @@ pub mod conformance {
             Err(OsError::Unsupported { op: "spawn", detail: "Fake has no process model".into() })
         }
         fn path_policy(&self) -> &dyn OsPathPolicy { self.policy.as_ref() }
+
+        // ── argv + UDS on the Fake (the in-memory paired-stream capability) ──
+        fn args(&self) -> Vec<String> { self.args.clone() }
+        fn uds_bind_listen(&self, path: &HostPath) -> Result<UdsListener, OsError> {
+            Ok(UdsListener::new(self.net.bind(path.as_str())?))
+        }
+        fn uds_accept(&self, listener: &UdsListener) -> Result<UdsStream, OsError> {
+            let st = listener.downcast_ref::<Arc<ListenerState>>()
+                .ok_or_else(|| OsError::Invalid { what: "UdsListener".into(), detail: "foreign handle".into() })?;
+            Ok(UdsStream::new(FakeNet::accept(st)))
+        }
+        fn uds_connect(&self, path: &HostPath) -> Result<UdsStream, OsError> {
+            Ok(UdsStream::new(self.net.connect(path.as_str())?))
+        }
+        fn stream_read(&self, stream: &UdsStream, buf: &mut [u8]) -> Result<usize, OsError> {
+            let end = stream.downcast_ref::<FakeStreamEnd>()
+                .ok_or_else(|| OsError::Invalid { what: "UdsStream".into(), detail: "foreign handle".into() })?;
+            end.rd.read(buf)
+        }
+        fn stream_write(&self, stream: &UdsStream, bytes: &[u8]) -> Result<usize, OsError> {
+            let end = stream.downcast_ref::<FakeStreamEnd>()
+                .ok_or_else(|| OsError::Invalid { what: "UdsStream".into(), detail: "foreign handle".into() })?;
+            end.wr.write(bytes)
+        }
+        fn stream_close(&self, stream: &UdsStream) -> Result<(), OsError> {
+            let end = stream.downcast_ref::<FakeStreamEnd>()
+                .ok_or_else(|| OsError::Invalid { what: "UdsStream".into(), detail: "foreign handle".into() })?;
+            end.wr.close();
+            end.rd.close();
+            Ok(())
+        }
     }
 
     // ──────────────── Conformance harness — the ONE suite, run against ANY `System` impl ────────────────
@@ -342,6 +560,42 @@ pub mod conformance {
         assert_eq!(before.file_id, after.file_id, "an in-place rewrite must keep the file id stable");
         assert!(after.mtime_nanos > before.mtime_nanos || after.len != before.len,
             "a rewrite MUST be visible in the dirty-check fields (mtime advanced or size changed): before={before:?} after={after:?}");
+    }
+
+    /// The argv capability (T10-flagged): `args()` reflects the constructed-in command line and does
+    /// NOT read the ambient process argv. Fake-only exact-match (the real impl's argv is the runtime
+    /// harness's — see the Darwin twin for the shape check).
+    pub fn args_reflect_construction(sys: &FakeSystem, expect: &[&str]) {
+        let exp: Vec<String> = expect.iter().map(|s| s.to_string()).collect();
+        assert_eq!(sys.args(), exp, "args() must return exactly the constructed argv, no ambient leakage");
+    }
+
+    /// The UDS byte-stream capability, run against ANY impl: bind→accept (a server thread) +
+    /// connect→write→read echo (the client), then a clean client close the server observes as `Ok(0)`.
+    /// The framing lives ABOVE this seam — this proves only that the raw byte pipe carries + EOFs.
+    pub fn uds_stream_echo(sys: Arc<dyn System>, sock: &HostPath) {
+        let listener = sys.uds_bind_listen(sock).expect("bind_listen must succeed");
+        let server_sys = sys.clone();
+        let server = std::thread::spawn(move || -> usize {
+            let s = server_sys.uds_accept(&listener).expect("accept must succeed");
+            let mut buf = [0u8; 64];
+            let n = server_sys.stream_read(&s, &mut buf).expect("server read");
+            server_sys.stream_write(&s, &buf[..n]).expect("server echo"); // echo the bytes back
+            let eof = server_sys.stream_read(&s, &mut buf).expect("server read to EOF");
+            server_sys.stream_close(&s).expect("server close");
+            eof
+        });
+
+        let client = sys.uds_connect(sock).expect("connect must succeed");
+        let msg = b"ping-through-the-seam";
+        assert_eq!(sys.stream_write(&client, msg).expect("client write"), msg.len());
+        let mut buf = [0u8; 64];
+        let n = sys.stream_read(&client, &mut buf).expect("client read echo");
+        assert_eq!(&buf[..n], msg, "the byte pipe must echo the exact bytes written");
+        sys.stream_close(&client).expect("client close");
+
+        let server_saw_eof = server.join().expect("server thread joins");
+        assert_eq!(server_saw_eof, 0, "server must observe a clean EOF (Ok(0)) after the client closes");
     }
 
     #[cfg(test)]

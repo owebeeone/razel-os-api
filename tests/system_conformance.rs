@@ -13,10 +13,11 @@
 //! `tools/test_raw_os.py` + `tools/wall_fixtures.py` (fixture_s3_raw_os_alias), REQ-SYSTEM-001/002/010.
 
 use razel_os_api::conformance::{
-    list_dir_is_deterministic, lstat_does_not_follow_final_symlink, metadata_dirtycheck_fields_see_rewrite,
-    missing_is_notfound, read_roundtrip, FakeSystem,
+    args_reflect_construction, list_dir_is_deterministic, lstat_does_not_follow_final_symlink,
+    metadata_dirtycheck_fields_see_rewrite, missing_is_notfound, read_roundtrip, uds_stream_echo, FakeSystem,
 };
 use razel_os_api::{EnvName, FileKind, HostPath, OsError, OsPathFragment, OsPathPolicy, ProcessSpec, System};
+use std::sync::Arc;
 
 fn p(s: &str) -> HostPath {
     HostPath::new(s)
@@ -188,6 +189,41 @@ fn system_is_send_sync_no_ambient_state() {
 }
 
 // ──────────────── REQ-SYSTEM-003 (shipped-surface half) — Unsupported is loud ────────────────
+
+// ──────────────── argv + UDS capability growth (os-system trait-growth reconcile, first slice) ────────────────
+
+/// The sanctioned argv capability (T10-flagged gap): `args()` returns the constructed-in command line
+/// and the default (no `with_args`) is empty — never the ambient process argv.
+#[test]
+fn args_reflect_constructed_argv() {
+    let fs = FakeSystem::new().with_args(&["razel-daemon", "batch", "build", "//hello:out.txt"]);
+    args_reflect_construction(&fs, &["razel-daemon", "batch", "build", "//hello:out.txt"]);
+    args_reflect_construction(&FakeSystem::new(), &[]);
+}
+
+/// The UDS byte-stream capability on the Fake half of the one suite (the SAME `uds_stream_echo` runs
+/// on `DarwinSystem` in razel-os-darwin/tests/conformance.rs — REQ-SYSTEM-005). bind→accept→
+/// connect→write→read echo→close, with the server observing a clean `Ok(0)` EOF.
+#[test]
+fn uds_byte_stream_echoes_on_fake() {
+    let fs: Arc<dyn System> = Arc::new(FakeSystem::new());
+    uds_stream_echo(fs, &p("/sock/echo"));
+}
+
+/// A closed peer is a typed error, never a silent drop: after the reader end closes, a write to it
+/// fails (the disconnect-cancel mechanism the comms layer builds on).
+#[test]
+fn uds_write_to_closed_peer_is_typed_error() {
+    let fs: Arc<dyn System> = Arc::new(FakeSystem::new());
+    let sock = p("/sock/closed");
+    let listener = fs.uds_bind_listen(&sock).expect("bind");
+    let client = fs.uds_connect(&sock).expect("connect");
+    let server = fs.uds_accept(&listener).expect("accept");
+    fs.stream_close(&server).expect("server closes"); // reader end gone
+    // The client's write to the now-closed peer must be a typed error (broken pipe), never Ok-and-dropped.
+    assert!(matches!(fs.stream_write(&client, b"lost"), Err(OsError::Io { .. })),
+        "write to a closed peer must be a typed error");
+}
 
 /// REQ-SYSTEM-003 vocabulary on the shipped surface: a capability an impl cannot provide is a typed
 /// `Unsupported` naming the op — never a silent success/fallback. (The `clone_file`-specific gate
