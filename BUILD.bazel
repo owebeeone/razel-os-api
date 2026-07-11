@@ -1,0 +1,14 @@
+# razel-os-api/BUILD.bazel — razel building its OWN System-seam crate (part of razel-cli's closure, via
+# razel-comms). Direct dep: razel-core (its source `use razel_core::{...}`). Multi-file with a NESTED module
+# dir (src/env/mock.rs).
+load("//rules/rust:rust.bzl", "rust_library")
+
+rust_library(
+    name = "razel_os_api",
+    srcs = [
+        "src/lib.rs",  # crate root (listed first)
+        "src/env.rs",
+        "src/env/mock.rs",
+    ],
+    deps = ["//razel-core:razel_core"],
+)
