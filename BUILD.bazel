@@ -11,4 +11,5 @@ rust_library(
         "src/env/mock.rs",
     ],
     deps = ["//razel-core:razel_core"],
+    visibility = ["//visibility:public"],  # C7: consumed cross-package (razel-comms)
 )

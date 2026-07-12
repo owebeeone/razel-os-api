@@ -13,10 +13,11 @@
 //! `tools/test_raw_os.py` + `tools/wall_fixtures.py` (fixture_s3_raw_os_alias), REQ-SYSTEM-001/002/010.
 
 use razel_os_api::conformance::{
-    args_reflect_construction, create_dir_all_is_observable, list_dir_is_deterministic,
-    lstat_does_not_follow_final_symlink, metadata_dirtycheck_fields_see_rewrite, missing_is_notfound,
-    read_roundtrip, remove_dir_all_clears_subtree, remove_file_clears_and_is_fail_closed,
-    rename_moves_bytes_and_clears_src, temp_dir_is_fresh_and_removable, uds_stream_echo, FakeSystem,
+    args_reflect_construction, create_dir_all_is_observable, current_exe_reflects_construction,
+    list_dir_is_deterministic, lstat_does_not_follow_final_symlink, metadata_dirtycheck_fields_see_rewrite,
+    missing_is_notfound, read_roundtrip, remove_dir_all_clears_subtree, remove_file_clears_and_is_fail_closed,
+    rename_moves_bytes_and_clears_src, temp_dir_is_fresh_and_removable, uds_bind_is_exclusive, uds_stream_echo,
+    FakeSystem,
 };
 use razel_os_api::{EnvName, FileKind, HostPath, OsError, OsPathFragment, OsPathPolicy, ProcessSpec, System};
 use std::sync::Arc;
@@ -198,9 +199,25 @@ fn system_is_send_sync_no_ambient_state() {
 /// and the default (no `with_args`) is empty — never the ambient process argv.
 #[test]
 fn args_reflect_constructed_argv() {
-    let fs = FakeSystem::new().with_args(&["razel-daemon", "batch", "build", "//hello:out.txt"]);
-    args_reflect_construction(&fs, &["razel-daemon", "batch", "build", "//hello:out.txt"]);
+    let fs = FakeSystem::new().with_args(&["razel", "batch", "build", "//hello:out.txt"]);
+    args_reflect_construction(&fs, &["razel", "batch", "build", "//hello:out.txt"]);
     args_reflect_construction(&FakeSystem::new(), &[]);
+}
+
+/// The current-exe capability (T18 "same binary" launch): `current_exe()` returns the constructed-in image
+/// path and an unset one is a loud `Unsupported` — never the ambient process image. Fake-exact; the Darwin
+/// twin (razel-os-darwin/tests/conformance.rs) does the runtime shape check.
+#[test]
+fn current_exe_reflects_constructed_image() {
+    current_exe_reflects_construction("/usr/local/bin/razel");
+}
+
+/// The UDS bind is EXCLUSIVE on the Fake half of the one suite (the SAME `uds_bind_is_exclusive` runs on
+/// `DarwinSystem`): a second bind on a held path fails, never orphans the first listener (T18 race-safety).
+#[test]
+fn uds_bind_is_exclusive_on_fake() {
+    let fs: Arc<dyn System> = Arc::new(FakeSystem::new());
+    uds_bind_is_exclusive(fs, &p("/sock/exclusive"));
 }
 
 /// Staging & exec-root primitives on the Fake half of the one suite (the SAME property fns run on the

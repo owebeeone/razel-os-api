@@ -168,6 +168,25 @@ pub trait System: Send + Sync {
     fn cwd(&self) -> Result<HostPath, OsError> {
         Err(OsError::Unsupported { op: "cwd", detail: "this System has no working-directory notion".into() })
     }
+    /// The path to the CURRENTLY-RUNNING executable image — the sanctioned "same binary" capability
+    /// (T18): a daemon-rooted client re-launches the daemon from ITS OWN image (`razel serve <sock>`)
+    /// through this, never a hardcoded path nor a `std::env::current_exe` above the seam (which the raw-OS
+    /// wall bans outside razel-os-darwin). Default: a loud `Unsupported` (an impl with no executable image).
+    fn current_exe(&self) -> Result<HostPath, OsError> {
+        Err(OsError::Unsupported { op: "current_exe", detail: "this System has no executable-image notion".into() })
+    }
+
+    // ──────────────── detached process launch (the daemon-launch flavor — additive) ────────────────
+    /// Spawn `spec` DETACHED: the child OUTLIVES this process (no wait, no tty tether — the razel daemon a
+    /// `razel build` client leaves running for the next warm invocation). stdin is null; stdout+stderr go to
+    /// `log` (created/appended) or are discarded when `None` — no zombie, no console spam. Returns the
+    /// child's OS pid (the honest daemon-identity handle for a `.razel/daemon.pid` file). This is DISTINCT
+    /// from [`System::spawn`], which WAITS for completion and is the action-execution primitive (untouched).
+    /// Default: a loud `Unsupported` (an impl with no process model — the same additive pattern as `spawn`).
+    fn spawn_detached(&self, spec: &ProcessSpec, log: Option<&HostPath>) -> Result<u32, OsError> {
+        let _ = (spec, log);
+        Err(OsError::Unsupported { op: "spawn_detached", detail: "this System has no process model".into() })
+    }
 
     // ──────────────── UDS byte-stream capability (blocking v1; framing lives above) ────────────────
     /// Bind a Unix-domain socket at `path` and start listening. Blocking accept (v1). Default: `Unsupported`.
@@ -440,6 +459,7 @@ pub mod conformance {
         env: EnvMap,
         policy: Box<dyn OsPathPolicy>,
         args: Vec<String>, // constructed-in argv (no ambient process argv — REQ-SYSTEM-015 shape)
+        exe: Option<String>, // constructed-in executable image path (no ambient current_exe)
         net: Arc<FakeNet>, // the process-local UDS broker (shared across an Arc<dyn System>)
     }
     impl Default for FakeSystem {
@@ -456,6 +476,7 @@ pub mod conformance {
                 env: EnvMap::new(),
                 policy: Box::new(IdentityPolicy),
                 args: Vec::new(),
+                exe: None,
                 net: Arc::new(FakeNet::new()),
             }
         }
@@ -465,6 +486,12 @@ pub mod conformance {
         /// Constructed-in argv snapshot — the Fake's `args()` reads THIS, never the ambient process argv.
         pub fn with_args(mut self, args: &[&str]) -> Self {
             self.args = args.iter().map(|s| s.to_string()).collect();
+            self
+        }
+        /// Constructed-in executable-image path — the Fake's `current_exe()` reads THIS, never any ambient
+        /// process image. Unset → `current_exe()` is a loud `Unsupported` (an impl with no image notion).
+        pub fn with_exe(mut self, exe: &str) -> Self {
+            self.exe = Some(exe.to_string());
             self
         }
         pub fn with_file(mut self, p: &str, bytes: &[u8]) -> Self {
@@ -624,6 +651,15 @@ pub mod conformance {
 
         // ── argv + UDS on the Fake (the in-memory paired-stream capability) ──
         fn args(&self) -> Vec<String> { self.args.clone() }
+        fn current_exe(&self) -> Result<HostPath, OsError> {
+            match &self.exe {
+                Some(p) => Ok(HostPath::new(p.clone())),
+                None => Err(OsError::Unsupported {
+                    op: "current_exe",
+                    detail: "FakeSystem has no executable image (construct one via with_exe)".into(),
+                }),
+            }
+        }
         fn uds_bind_listen(&self, path: &HostPath) -> Result<UdsListener, OsError> {
             Ok(UdsListener::new(self.net.bind(path.as_str())?))
         }
@@ -768,6 +804,27 @@ pub mod conformance {
     pub fn args_reflect_construction(sys: &FakeSystem, expect: &[&str]) {
         let exp: Vec<String> = expect.iter().map(|s| s.to_string()).collect();
         assert_eq!(sys.args(), exp, "args() must return exactly the constructed argv, no ambient leakage");
+    }
+
+    /// The current-exe capability (T18): `current_exe()` reflects the constructed-in image path and does
+    /// NOT read any ambient process image; unset is a LOUD `Unsupported`, never a silent default. Fake-only
+    /// exact-match (the real impl's image is the runtime harness's — see the Darwin twin for the shape check).
+    pub fn current_exe_reflects_construction(expect: &str) {
+        let sys = FakeSystem::new().with_exe(expect);
+        assert_eq!(sys.current_exe().expect("current_exe must succeed when constructed-in").as_str(), expect,
+            "current_exe() must return exactly the constructed image path, no ambient leakage");
+        assert!(matches!(FakeSystem::new().current_exe(), Err(OsError::Unsupported { op: "current_exe", .. })),
+            "an unset current_exe() is a LOUD Unsupported, never a silent default");
+    }
+
+    /// The UDS bind is EXCLUSIVE (T18 race-safety): a second `uds_bind_listen` on a path a first listener
+    /// already holds is a typed error, NEVER a silent clobber that would orphan the first daemon. This is
+    /// the primitive that makes the connect-or-launch race benign — the losing `serve` fails to bind and
+    /// exits, both clients connecting to the winner. Runs on ANY impl (Fake + Darwin — one suite).
+    pub fn uds_bind_is_exclusive(sys: Arc<dyn System>, sock: &HostPath) {
+        let _first = sys.uds_bind_listen(sock).expect("first bind must succeed");
+        assert!(sys.uds_bind_listen(sock).is_err(),
+            "a second bind on a live socket path must FAIL (address-in-use), never clobber the first listener");
     }
 
     /// The UDS byte-stream capability, run against ANY impl: bind→accept (a server thread) +
